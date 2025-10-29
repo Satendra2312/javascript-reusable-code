@@ -1,12 +1,9 @@
-// Convert buffer to hex
-async function bufToHex(buf) {
-    return Array.from(new Uint8Array(buf))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-}
+//Convert buffer to hex
+const bufToHex = (buf) =>
+    Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 
 // Canonical JSON (sorted keys)
-function canonicalJSON(obj) {
+const canonicalJSON = (obj) => {
     if (obj === null) return "null";
     if (Array.isArray(obj)) return `[${obj.map(canonicalJSON).join(",")}]`;
     if (typeof obj === "object") {
@@ -16,10 +13,10 @@ function canonicalJSON(obj) {
             .join(",")}}`;
     }
     return JSON.stringify(obj);
-}
+};
 
-// Concatenate multiple byte arrays
-function concatBytes(...arrays) {
+//Concatenate byte arrays
+const concatBytes = (...arrays) => {
     const total = arrays.reduce((sum, arr) => sum + arr.length, 0);
     const out = new Uint8Array(total);
     let offset = 0;
@@ -28,24 +25,19 @@ function concatBytes(...arrays) {
         offset += arr.length;
     }
     return out;
-}
+};
 
-// Audit log hook
-function auditLog(label, value) {
-    console.debug(`[AUDIT] ${label}:`, value);
-}
+// Audit log toggle
+const DEBUG = true;
+const auditLog = (label, value) => {
+    if (DEBUG) console.debug(`[AUDIT] ${label}:`, value);
+};
 
 // Derive AES key using HKDF
-async function deriveAESKeyHKDF(secret, salt, info) {
+const deriveAESKeyHKDF = async (secret, salt, info) => {
     const enc = new TextEncoder();
-    const baseKey = await crypto.subtle.importKey(
-        "raw",
-        enc.encode(secret),
-        "HKDF",
-        false,
-        ["deriveKey"]
-    );
-    return await crypto.subtle.deriveKey(
+    const baseKey = await crypto.subtle.importKey("raw", enc.encode(secret), "HKDF", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey(
         {
             name: "HKDF",
             hash: "SHA-256",
@@ -57,74 +49,56 @@ async function deriveAESKeyHKDF(secret, salt, info) {
         false,
         ["encrypt"]
     );
-}
+};
 
-// Encrypt payload using AES-GCM with additional authenticated data
-async function encryptPayloadAESGCM(payload, aesKey, aad) {
-    const enc = new TextEncoder();
+// Encrypt payload using AES-GCM
+const encryptPayloadAESGCM = async (canonicalPayload, aesKey, aad) => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv, additionalData: aad },
         aesKey,
-        enc.encode(JSON.stringify(payload))
+        new TextEncoder().encode(canonicalPayload)
     );
     return {
-        ivHex: await bufToHex(iv),
-        ciphertextHex: await bufToHex(ciphertext),
+        ivHex: bufToHex(iv),
+        ciphertextHex: bufToHex(ciphertext),
     };
-}
+};
 
-// Generate secure package and return final hash
-async function generateSecurePackageV1({
+// Generate Secure Package
+const generateSecurePackageV1 = async ({
     payload,
     accessKeySecret,
     accessKeyId,
     identifierName,
-}) {
+}) => {
     const enc = new TextEncoder();
     const version = "v1";
 
-    if (!accessKeySecret || accessKeySecret.trim() === "") {
+    if (!accessKeySecret?.trim()) {
         throw new Error("Missing accessKeySecret: cannot generate HMAC key");
     }
 
     const canonicalPayload = canonicalJSON(payload);
-
-    // Inner hash of canonical payload
-    const innerHashBuf = await crypto.subtle.digest(
-        "SHA-256",
-        enc.encode(canonicalPayload)
-    );
-    const innerHashHex = await bufToHex(innerHashBuf);
-    auditLog("Inner Hash", innerHashHex);
-
-    // Nonce and timestamp
     const nonce = crypto.randomUUID();
     const timestamp = String(Date.now());
+    const aad = enc.encode(`${identifierName}|${timestamp}|${nonce}`);
+
+    // Parallelize inner hash, AES key derivation, and HMAC key import
+    const [innerHashBuf, aesKey, hmacKey] = await Promise.all([
+        crypto.subtle.digest("SHA-256", enc.encode(canonicalPayload)),
+        deriveAESKeyHKDF(accessKeySecret, nonce, "aes-gcm-encryption"),
+        crypto.subtle.importKey("raw", enc.encode(accessKeySecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+    ]);
+
+    const innerHashHex = bufToHex(innerHashBuf);
+    auditLog("Inner Hash", innerHashHex);
     auditLog("Nonce", nonce);
     auditLog("Timestamp", timestamp);
 
-    // Derive AES key
-    const aesKey = await deriveAESKeyHKDF(
-        accessKeySecret,
-        nonce,
-        "aes-gcm-encryption"
-    );
-
-    // Encrypt payload with AAD
-    const aad = enc.encode(`${identifierName}|${timestamp}|${nonce}`);
-    const encryption = await encryptPayloadAESGCM(payload, aesKey, aad);
+    const encryption = await encryptPayloadAESGCM(canonicalPayload, aesKey, aad);
     auditLog("IV", encryption.ivHex);
     auditLog("Ciphertext", encryption.ciphertextHex);
-
-    // HMAC signing
-    const hmacKey = await crypto.subtle.importKey(
-        "raw",
-        enc.encode(accessKeySecret),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-    );
 
     const signData = concatBytes(
         enc.encode(version),
@@ -141,10 +115,9 @@ async function generateSecurePackageV1({
     );
 
     const sigBuf = await crypto.subtle.sign("HMAC", hmacKey, signData);
-    const signatureHex = await bufToHex(sigBuf);
+    const signatureHex = bufToHex(sigBuf);
     auditLog("Signature", signatureHex);
 
-    // Build package object
     const packageObject = {
         version,
         identifier: identifierName,
@@ -156,30 +129,12 @@ async function generateSecurePackageV1({
         encryption,
     };
 
-    // Final hash of full package + canonical string
     const canonicalPackage = canonicalJSON(packageObject);
-    const fullBundle = {
-        package: packageObject,
-        canonical: canonicalPackage,
-    };
-
-    const bundleString = canonicalJSON(fullBundle);
-    const finalHashBuf = await crypto.subtle.digest(
-        "SHA-256",
-        enc.encode(bundleString)
-    );
-    const finalFingerprintHex = await bufToHex(finalHashBuf);
+    const finalHashBuf = await crypto.subtle.digest("SHA-256", enc.encode(canonicalPackage));
+    const finalFingerprintHex = bufToHex(finalHashBuf);
     auditLog("Final Combined Hash", finalFingerprintHex);
 
     return {
         secure_hash: finalFingerprintHex,
     };
-}
-
-//Call This
-// const securePackage = await generateSecurePackageV1({
-//         payload: data,
-//         accessKeySecret: secretKey,
-//         accessKeyId: token,
-//         identifierName,
-//     });
+};
