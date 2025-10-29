@@ -180,6 +180,6 @@ async function generateSecurePackageV1({
 // const securePackage = await generateSecurePackageV1({
 //         payload: data,
 //         accessKeySecret: secretKey,
-//         accessKeyId: payment_token_id,
+//         accessKeyId: token,
 //         identifierName,
 //     });
